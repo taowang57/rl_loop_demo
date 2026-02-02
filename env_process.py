@@ -133,7 +133,8 @@ class EnvProcess:
                 self.metadata_gpu[METADATA.policy_ready // 4] = 0
                 cp.cuda.Stream.null.synchronize()
                 return
-            time.sleep(0.0001)  # 100μs 轮询
+            # Busy wait for low latency (< 5μs)
+            pass
     
     def signal_env_ready(self):
         """通知 Policy 进程 Env 已完成"""

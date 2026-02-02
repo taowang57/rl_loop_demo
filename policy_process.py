@@ -131,7 +131,8 @@ class PolicyProcess:
                 cp.cuda.Stream.null.synchronize()
                 return True
             
-            time.sleep(0.0001)  # 100μs 轮询
+            # Busy wait for low latency (< 5μs)
+            pass
     
     def signal_policy_ready(self):
         """通知 Env 进程 Policy 已完成"""
