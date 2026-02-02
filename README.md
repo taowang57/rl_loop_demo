@@ -254,6 +254,22 @@ rl_loop_demo/
 
 ---
 
+## 开发指南
+
+### 代码格式化
+
+格式化代码:
+```bash
+uv run ruff format .
+```
+
+检查代码风格:
+```bash
+uv run ruff check --fix .
+```
+
+---
+
 ## 常见问题 FAQ
 
 ### Q1: 为什么需要单独安装 nvidia-* CUDA 库包？
