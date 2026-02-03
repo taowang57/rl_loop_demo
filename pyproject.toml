@@ -1,12 +1,15 @@
 [project]
 name = "rl-loop-demo"
-version = "1.0.0"
-description = "CUDA IPC 跨进程 GPU 显存共享 RL 演示项目"
+version = "1.1.0"
+description = "CUDA IPC 跨进程 GPU 显存共享 RL 演示项目 (含 PyTorch 神经网络)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "cupy-cuda12x>=13.0.0 ; sys_platform != 'darwin'",
     "numpy>=2.0.0",
+    # PyTorch (使用 DLPack 与 CuPy 零拷贝互操作)
+    # 注: Python 3.12 需要 PyTorch 2.2+
+    "torch>=2.2.0",
     # NVIDIA CUDA 运行时库 (解决 libnvrtc.so.12 等缺失问题)
     "nvidia-cuda-nvrtc-cu12 ; sys_platform != 'darwin'",
     "nvidia-cuda-runtime-cu12 ; sys_platform != 'darwin'",

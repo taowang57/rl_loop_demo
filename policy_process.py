@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025
 """
-policy_process.py - 策略进程
+policy_process.py - 策略进程 (PyTorch 神经网络版本)
 
 负责:
 1. 接收 CUDA IPC 句柄
 2. 导入共享 GPU 缓冲区
-3. 运行神经网络推理 (模拟)
-4. 与 Env 进程同步
+3. 使用 PyTorch MLP 进行神经网络推理
+4. 通过 DLPack 实现 CuPy ↔ PyTorch 零拷贝转换
+5. 与 Env 进程同步
 """
 
 try:
@@ -15,6 +16,13 @@ try:
     from cupy.cuda import runtime as cuda_runtime
 except ImportError:
     print("错误: 请安装 CuPy (pip install cupy-cuda12x)")
+    exit(1)
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    print("错误: 请安装 PyTorch (pip install torch)")
     exit(1)
 
 from ipc_utils import receive_ipc_handle
@@ -53,8 +61,38 @@ def print_memory_region_info(name: str, array, base_ptr: int, process: str = "Po
     )
 
 
+class SimpleMLP(nn.Module):
+    """
+    简单的多层感知器 (MLP) 策略网络
+
+    架构: State → Linear(64) → ReLU → Linear(64) → ReLU → Linear(Action) → Tanh
+
+    输出范围 [-1, 1]，适用于连续动作空间。
+    """
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Tanh(),  # 输出范围 [-1, 1]
+        )
+
+        # 初始化权重 (Xavier 初始化)
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class PolicyProcess:
-    """策略进程：管理神经网络推理"""
+    """策略进程：管理神经网络推理（使用 PyTorch）"""
 
     def __init__(self):
         self.buffer_ptr = None
@@ -64,6 +102,32 @@ class PolicyProcess:
         self.metadata_gpu = None
         self.imported_ptr = None
         self.base_ptr = None  # IPC 导入的基地址
+
+        # PyTorch 模型
+        self.model = None
+        self.device = None
+
+    def init_pytorch_model(self):
+        """初始化 PyTorch 神经网络模型"""
+        # 确保 PyTorch 使用与 CuPy 相同的 CUDA 设备
+        self.device = torch.device("cuda:0")
+
+        # 创建 MLP 策略网络
+        self.model = SimpleMLP(
+            state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden_dim=64
+        ).to(self.device)
+
+        # 设置为评估模式 (禁用 dropout 等)
+        self.model.eval()
+
+        # 统计模型参数量
+        num_params = sum(p.numel() for p in self.model.parameters())
+
+        print("[Policy] PyTorch MLP 初始化完成:")
+        print(f"  设备: {self.device}")
+        print(f"  架构: {STATE_DIM} → 64 → 64 → {ACTION_DIM}")
+        print(f"  参数量: {num_params:,}")
+        print("  输出激活: Tanh (范围 [-1, 1])")
 
     def import_shared_buffer(self, handle: bytes, total_size: int):
         """从 IPC 句柄导入共享缓冲区"""
@@ -143,42 +207,73 @@ class PolicyProcess:
 
     def policy_inference(self, step: int):
         """
-        执行策略推理 (模拟)
+        执行策略推理（使用 PyTorch 神经网络）
 
-        真实场景中这里会运行 PyTorch/JAX 神经网络推理。
-        这里用简单的线性策略模拟。
+        数据流:
+        1. CuPy 数组 (IPC 共享) → DLPack → PyTorch Tensor (零拷贝)
+        2. PyTorch 神经网络推理
+        3. PyTorch Tensor → DLPack → CuPy 数组 (零拷贝写回)
         """
-        show_addr = step % 10 == 0  # 每 10 步打印一次地址信息
+        show_addr = step % 10 == 0  # 每 10 步打印一次详细信息
 
-        # 读取 State (由 Env 写入)
-        state_ptr = self.state_gpu.data.ptr
+        # ============================================================
+        # Step 1: CuPy → PyTorch (零拷贝，通过 DLPack)
+        # ============================================================
+        state_cupy_ptr = self.state_gpu.data.ptr
+
+        # 使用 DLPack 协议进行零拷贝转换
+        # CuPy array → DLPack capsule → PyTorch tensor
+        state_torch = torch.from_dlpack(self.state_gpu)
+
         if show_addr:
+            state_torch_ptr = state_torch.data_ptr()
+            print(f"[Policy] Step {step:3d} 零拷贝转换验证:")
+            print(f"         CuPy  State 地址: {format_addr(state_cupy_ptr)}")
+            print(f"         Torch State 地址: {format_addr(state_torch_ptr)}")
             print(
-                f"[Policy] Step {step:3d} 读取 State:  "
-                f"虚拟地址={format_addr(state_ptr)} "
-                f"(基址+{state_ptr - self.base_ptr})"
+                f"         地址相同: {state_cupy_ptr == state_torch_ptr} ✓"
+                if state_cupy_ptr == state_torch_ptr
+                else "         地址不同: ✗"
             )
 
-        state = self.state_gpu
+        # ============================================================
+        # Step 2: PyTorch 神经网络推理
+        # ============================================================
+        with torch.no_grad():
+            action_torch = self.model(state_torch)
 
-        # 模拟神经网络推理: Action = -0.1 * State[:, :ACTION_DIM]
-        # 真实场景: action = model(state)
-        action_ptr = self.action_gpu.data.ptr
         if show_addr:
             print(
-                f"[Policy] Step {step:3d} 写入 Action: "
-                f"虚拟地址={format_addr(action_ptr)} "
-                f"(基址+{action_ptr - self.base_ptr})"
+                f"         MLP 推理完成: [{NUM_ENVS}, {STATE_DIM}] → [{NUM_ENVS}, {ACTION_DIM}]"
             )
 
-        self.action_gpu[:] = -0.1 * state[:, :ACTION_DIM]
-        self.action_gpu[:] = cp.clip(self.action_gpu, -1.0, 1.0)
+        # ============================================================
+        # Step 3: PyTorch → CuPy (零拷贝写回)
+        # ============================================================
+        action_cupy_ptr = self.action_gpu.data.ptr
 
+        # 方法: 将 PyTorch 输出转换为 CuPy，然后复制到共享缓冲区
+        # 注意: action_torch 是新分配的内存，需要复制到 IPC 共享区域
+        action_from_torch = cp.from_dlpack(action_torch)
+        self.action_gpu[:] = action_from_torch
+
+        if show_addr:
+            action_torch_ptr = action_torch.data_ptr()
+            print(
+                f"         Torch Action 地址: {format_addr(action_torch_ptr)} (MLP 输出)"
+            )
+            print(
+                f"         CuPy  Action 地址: {format_addr(action_cupy_ptr)} (IPC 共享)"
+            )
+            print("         注: MLP 输出是新内存，需复制到 IPC 共享区域")
+
+        # 确保 GPU 操作完成
         cp.cuda.Stream.null.synchronize()
 
     def run_loop(self):
         """运行策略推理循环"""
-        print("[Policy] 开始策略推理循环")
+        print("[Policy] 开始 PyTorch 策略推理循环")
+        print()
 
         step = 0
         while True:
@@ -187,7 +282,7 @@ class PolicyProcess:
             if not should_continue:
                 break
 
-            # 2. 执行策略推理
+            # 2. 执行策略推理 (PyTorch MLP)
             self.policy_inference(step)
 
             # 3. 通知 Env 进程
@@ -199,11 +294,11 @@ class PolicyProcess:
                 print(
                     f"[Policy] Step {current_step:3d} | Avg |Action|: {avg_action:.4f}"
                 )
-                print("")
+                print()
 
             step += 1
 
-        print("[Policy] 策略推理循环结束")
+        print("[Policy] PyTorch 策略推理循环结束")
 
     def cleanup(self):
         """清理资源"""
@@ -216,14 +311,19 @@ def main():
     policy = PolicyProcess()
 
     try:
-        # 1. 接收 IPC 句柄
+        # 1. 初始化 PyTorch 模型
+        policy.init_pytorch_model()
+        print()
+
+        # 2. 接收 IPC 句柄
         handle, total_size, info = receive_ipc_handle()
         print(f"[Policy] 缓冲区信息: {info}")
 
-        # 2. 导入共享缓冲区
+        # 3. 导入共享缓冲区
         policy.import_shared_buffer(handle, total_size)
+        print()
 
-        # 3. 运行策略推理循环
+        # 4. 运行策略推理循环
         policy.run_loop()
 
     finally:
